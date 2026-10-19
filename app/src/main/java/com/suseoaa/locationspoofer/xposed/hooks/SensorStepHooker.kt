@@ -30,6 +30,15 @@ import java.lang.reflect.Field
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
+/**
+ * 以 startTime 为起点计算累计步数；起点非法或位于未来时只返回基数。
+ */
+internal fun calculateSteps(baseSteps: Long, startTime: Long, now: Long, cadenceSpm: Double): Long {
+    if (startTime <= 0L) return baseSteps
+    val elapsedSec = ((now - startTime).coerceAtLeast(0L)) / 1000.0
+    return baseSteps + (elapsedSec * (cadenceSpm / 60.0)).toLong()
+}
+
 object SensorStepHooker {
 
     data class CapturedSensorListener(
@@ -246,16 +255,18 @@ object SensorStepHooker {
      * 计算当前仿真总步数
      */
     fun calculateCurrentSteps(config: JSONObject, now: Long = System.currentTimeMillis()): Long {
-        val startTime = config.optLong("start_timestamp", now)
+        val startTime = config.optLong("start_timestamp", 0L)
+        // 时间戳无效时冻结在当前计数：既不从 1970 年起算，也不改动基准，避免恢复后重复累计
+        if (startTime <= 0L) return lastCalculatedSteps
         if (lastStepInitTime != startTime) {
             lastStepInitTime = startTime
-            baseBootSteps = 2350L
+            // 接续上次计数而不是回到 2350：微信把步数回退当成传感器重启，会重复累加
+            baseBootSteps = lastCalculatedSteps
         }
 
         val speed = config.optDouble("speed_m_s", 0.0)
         if (speed <= 0.05) return lastCalculatedSteps
 
-        val elapsedSec = ((now - startTime).coerceAtLeast(0L)) / 1000.0
         val isAutoCadence = config.optBoolean("is_auto_cadence", true)
         val cadenceSpm = if (isAutoCadence) {
             calculateAutoCadence(speed)
@@ -263,8 +274,7 @@ object SensorStepHooker {
             config.optInt("step_cadence_spm", 165).coerceIn(60, 240)
         }
 
-        val stepsToAdd = (elapsedSec * (cadenceSpm / 60.0)).toLong()
-        lastCalculatedSteps = baseBootSteps + stepsToAdd
+        lastCalculatedSteps = calculateSteps(baseBootSteps, startTime, now, cadenceSpm.toDouble())
         return lastCalculatedSteps
     }
 

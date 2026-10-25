@@ -59,6 +59,12 @@ object SensorStepHooker {
     private var mockStepDetectorSensor: Sensor? = null
     private var mockAccelerometerSensor: Sensor? = null
 
+    // 虚拟传感器不复用框架的 handle 空间（默认为 0，会和加速度计撞车），统一放在私有段
+    private const val MOCK_HANDLE_BASE = 0x7F000000
+
+    // 上一次派发 STEP_DETECTOR 时的步数下标：按累计步数的增量发事件，而不是固定每秒 1 次
+    @Volatile private var lastDispatchedStepIndex: Long = -1L
+
     // 跟踪 handle 到 sensor type 的映射
     private val handleToTypeMap = ConcurrentHashMap<Int, Int>()
 
@@ -128,13 +134,24 @@ object SensorStepHooker {
                                     capturedListeners.add(entry)
                                 }
 
+                                // 动态 Hook 该 Listener 的具体实现类中的 onSensorChanged 方法
+                                hookConcreteListenerClass(listener.javaClass, classLoader)
+
+                                // 虚拟传感器是本模块凭空造出来的，框架里并不存在对应的硬件通道。
+                                // 若继续走原生注册，Sensor.getHandle() 的默认值 0 会撞上加速度计（handle 0），
+                                // App 以为订阅了计步器，实际收到的是加速度计的 15~50Hz 数据流，
+                                // 事件计数型步频算法会把这一串事件全部算成步数（模拟器上步频飙到数百的根因）。
+                                // 因此虚拟传感器只记录回调，事件全部由 dispatchStepEvents 按设定步频派发。
+                                if (isMockSensor(targetSensor)) {
+                                    return@hookAllMethods true
+                                }
+
                                 val handle = getSensorHandle(targetSensor)
                                 if (handle != null) {
                                     handleToTypeMap[handle] = targetSensor.type
                                 }
-
-                                // 动态 Hook 该 Listener 的具体实现类中的 onSensorChanged 方法
-                                hookConcreteListenerClass(listener.javaClass, classLoader)
+                            } else if (isMockSensor(sensor)) {
+                                return@hookAllMethods true
                             }
                         }
 
@@ -150,8 +167,14 @@ object SensorStepHooker {
                     XposedHelpers.hookAllMethods(managerClass, methodName) { chain, _ ->
                         val args = chain.args
                         val listener = args.firstOrNull { it != null && (it is SensorEventListener || LocationHooker.hasTypeByName(it.javaClass, "android.hardware.SensorEventListener")) }
+                        val sensor = args.firstOrNull { it is Sensor } as? Sensor
                         if (listener != null) {
                             capturedListeners.removeAll { it.listener === listener }
+                        }
+                        // 虚拟传感器从没向框架注册过，不能把注销透传下去：
+                        // 否则会误伤同一个 Listener 在真实传感器上的注册
+                        if (isMockSensor(sensor)) {
+                            return@hookAllMethods true
                         }
                         return@hookAllMethods chain.proceed(chain.args.toTypedArray())
                     }
@@ -179,17 +202,14 @@ object SensorStepHooker {
                         val sensorType = handleToTypeMap[handle]
                         val speed = config.optDouble("speed_m_s", 0.0)
 
-                        if (sensorType == Sensor.TYPE_STEP_COUNTER) {
-                            // 仅对明确判定的计步器传感器进行步数计算，严禁误判光感/距离传感器
-                            val curSteps = calculateCurrentSteps(config)
-                            values[0] = curSteps.toFloat()
-                        } else if (sensorType == Sensor.TYPE_STEP_DETECTOR) {
-                            if (speed > 0.1) {
-                                values[0] = 1.0f
-                            }
-                        } else if (sensorType == Sensor.TYPE_ACCELEROMETER && values.size >= 3) {
-                            // 加速度计传感器：仅在运动中(speed > 0.1)叠加生理跑步/步行震动特征，静态时绝不篡改
-                            if (speed > 0.1) {
+                        when (sensorType) {
+                            // 平台计步事件一律丢弃：真机上硬件计步器只在真正走了一步时才发事件，
+                            // 但部分设备/模拟器的虚拟传感器会按采样周期无条件下发，
+                            // 若放行就会被步频算法当成额外步数（模拟器上步频虚高的根因）。
+                            // 步数完全由 dispatchStepEvents 按设定步频派发，真机与模拟器行为一致。
+                            Sensor.TYPE_STEP_COUNTER, Sensor.TYPE_STEP_DETECTOR -> return@hookAllMethods null
+                            Sensor.TYPE_ACCELEROMETER -> if (values.size >= 3 && speed > 0.1) {
+                                // 加速度计：仅在运动中叠加生理跑步/步行震动特征，静态时绝不篡改
                                 applySyntheticVibration(values, config, speed)
                             }
                         }
@@ -238,18 +258,17 @@ object SensorStepHooker {
                         val config = (XposedHelpers.module as? LocationHooker)?.readConfig()
                         if (config != null && config.optBoolean("active", false) && config.optBoolean("enable_step_simulation", true)) {
                             val speed = config.optDouble("speed_m_s", 0.0)
+                            // 只改数值，不动 event.timestamp：时间戳是硬件采样时刻，覆写成"当前分发时刻"
+                            // 会让 App 的步频滤波窗口（Δt）失真，模拟器批量投递时甚至趋近 0。
                             if (event.sensor.type == Sensor.TYPE_STEP_COUNTER && event.values.isNotEmpty()) {
                                 val curSteps = calculateCurrentSteps(config)
                                 event.values[0] = curSteps.toFloat()
-                                event.timestamp = SystemClock.elapsedRealtimeNanos()
                             } else if (event.sensor.type == Sensor.TYPE_STEP_DETECTOR && event.values.isNotEmpty()) {
                                 if (speed > 0.1) {
                                     event.values[0] = 1.0f
-                                    event.timestamp = SystemClock.elapsedRealtimeNanos()
                                 }
                             } else if (event.sensor.type == Sensor.TYPE_ACCELEROMETER && event.values.size >= 3 && speed > 0.1) {
                                 applySyntheticVibration(event.values, config, speed)
-                                event.timestamp = SystemClock.elapsedRealtimeNanos()
                             }
                         }
                     }
@@ -338,42 +357,29 @@ object SensorStepHooker {
         val now = System.currentTimeMillis()
         val totalSteps = calculateCurrentSteps(config, now)
 
+        // STEP_DETECTOR 的语义是"一次事件 = 一步"，所以按累计步数的增量派发，
+        // 而不是固定每秒 1 次（固定 1 次会让设定 240 步/分也只能得到 60）。
+        val currentStepIndex = totalSteps
+        val previousStepIndex = lastDispatchedStepIndex
+        lastDispatchedStepIndex = currentStepIndex
+        val stepDelta = if (previousStepIndex < 0) 0L else (currentStepIndex - previousStepIndex).coerceIn(0L, 12L)
+
         val listeners = capturedListeners.toList()
         if (listeners.isEmpty()) return
 
         for (entry in listeners) {
-            val listener = entry.listener
             val sensor = entry.sensor ?: continue
-            val targetHandler = entry.handler ?: Handler(Looper.getMainLooper())
 
             when (sensor.type) {
                 Sensor.TYPE_STEP_COUNTER -> {
                     val event = createSensorEvent(sensor, floatArrayOf(totalSteps.toFloat()))
-                    if (event != null) {
-                        targetHandler.post {
-                            try {
-                                if (listener is SensorEventListener) {
-                                    listener.onSensorChanged(event)
-                                } else {
-                                    XposedHelpers.callMethod(listener, "onSensorChanged", event)
-                                }
-                            } catch (_: Throwable) {}
-                        }
-                    }
+                    if (event != null) deliver(entry, event)
                 }
                 Sensor.TYPE_STEP_DETECTOR -> {
-                    if (speed > 0.1) {
-                        val event = createSensorEvent(sensor, floatArrayOf(1.0f))
-                        if (event != null) {
-                            targetHandler.post {
-                                try {
-                                    if (listener is SensorEventListener) {
-                                        listener.onSensorChanged(event)
-                                    } else {
-                                        XposedHelpers.callMethod(listener, "onSensorChanged", event)
-                                    }
-                                } catch (_: Throwable) {}
-                            }
+                    if (stepDelta > 0) {
+                        repeat(stepDelta.toInt()) {
+                            val event = createSensorEvent(sensor, floatArrayOf(1.0f))
+                            if (event != null) deliver(entry, event)
                         }
                     }
                 }
@@ -382,20 +388,24 @@ object SensorStepHooker {
                         val rawValues = floatArrayOf(0f, 0f, 9.8f)
                         applySyntheticVibration(rawValues, config, speed)
                         val event = createSensorEvent(sensor, rawValues)
-                        if (event != null) {
-                            targetHandler.post {
-                                try {
-                                    if (listener is SensorEventListener) {
-                                        listener.onSensorChanged(event)
-                                    } else {
-                                        XposedHelpers.callMethod(listener, "onSensorChanged", event)
-                                    }
-                                } catch (_: Throwable) {}
-                            }
-                        }
+                        if (event != null) deliver(entry, event)
                     }
                 }
             }
+        }
+    }
+
+    /** 把模块生成的 SensorEvent 投递到 App 原本的 Handler，失败静默 */
+    private fun deliver(entry: CapturedSensorListener, event: SensorEvent) {
+        val targetHandler = entry.handler ?: Handler(Looper.getMainLooper())
+        targetHandler.post {
+            try {
+                if (entry.listener is SensorEventListener) {
+                    entry.listener.onSensorChanged(event)
+                } else {
+                    XposedHelpers.callMethod(entry.listener, "onSensorChanged", event)
+                }
+            } catch (_: Throwable) {}
         }
     }
 
@@ -408,6 +418,10 @@ object SensorStepHooker {
             null
         }
     }
+
+    /** 这个 Sensor 是不是本模块造出来的虚拟传感器（框架里没有对应的硬件通道） */
+    private fun isMockSensor(sensor: Sensor?): Boolean =
+        sensor != null && (sensor === mockStepCounterSensor || sensor === mockStepDetectorSensor || sensor === mockAccelerometerSensor)
 
     private fun getOrCreateMockSensor(type: Int, classLoader: ClassLoader): Sensor? {
         if (type == Sensor.TYPE_STEP_COUNTER && mockStepCounterSensor != null) return mockStepCounterSensor
@@ -426,10 +440,22 @@ object SensorStepHooker {
                 Sensor.TYPE_STEP_DETECTOR -> "Step Detector Sensor"
                 else -> "Accelerometer Sensor"
             })
+            setSensorField(sensor, "mStringType", when(type) {
+                Sensor.TYPE_STEP_COUNTER -> "android.sensor.step_counter"
+                Sensor.TYPE_STEP_DETECTOR -> "android.sensor.step_detector"
+                else -> "android.sensor.accelerometer"
+            })
             setSensorField(sensor, "mVendor", "Android")
             setSensorField(sensor, "mVersion", 1)
             setSensorField(sensor, "mResolution", 1.0f)
             setSensorField(sensor, "mPower", 0.05f)
+            setSensorField(sensor, "mMaxRange", if (type == Sensor.TYPE_STEP_COUNTER) 1.0e7f else 1.0f)
+            // 私有 handle 段：绝不复用 0，避免和加速度计等真实传感器撞车
+            setSensorField(sensor, "mHandle", MOCK_HANDLE_BASE or type)
+            setSensorField(sensor, "mMinDelay", 0)
+            setSensorField(sensor, "mMaxDelay", 0)
+            setSensorField(sensor, "mFifoReservedEventCount", 0)
+            setSensorField(sensor, "mFifoMaxEventCount", 0)
 
             when (type) {
                 Sensor.TYPE_STEP_COUNTER -> mockStepCounterSensor = sensor
